@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # Podman in the host container needs a rootful, privileged container.
+          PODMAN: sudo podman
+        run: ./up.sh
+      # The release before the default, so the upgrade below has a stack to
+      # carry.
+      - name: Apply the previous release, then plan again with no changes
+        working-directory: examples/local
+        env:
+          TF_VAR_dockge_version: "1.4.2"
+          TF_VAR_image_digest: sha256:ec889251baff476366783bc4a092aaa08c601f377537a0f30fb922754edcd9b7
+        run: |
+          conn3x init
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # Creates the admin over Dockge's socket.io API, the way the setup page
+      # does, and deploys a stack with docker compose against Podman's API:
+      # one nginx on a bridge network, published on 127.0.0.1:18080.
+      - name: Create the admin and deploy a stack
+        working-directory: examples/local
+        run: |
+          sudo podman exec -i circuit-dockge podman exec -i dockge node - setup < check.js
+          sudo podman exec circuit-dockge test -f /opt/stacks/hello/compose.yaml
+          sudo podman exec circuit-dockge podman ps --format '{{.Names}}' | grep -qx hello-web-1
+      - name: Upgrade to the default release, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+          sudo podman exec circuit-dockge podman inspect dockge --format '{{.ImageName}}' | grep -q '@sha256:335c6368b880'
+      - name: Log in and find the stack running after the upgrade
+        working-directory: examples/local
+        run: &verify sudo podman exec -i circuit-dockge podman exec -i dockge node - verify < check.js
+      # Restarting the container boots systemd again, so this checks Dockge is
+      # enabled and comes back, and that podman-restart.service brings the
+      # stack's container back as Docker's daemon would.
+      - name: Restart the host, then wait for Dockge
+        run: |
+          sudo podman restart circuit-dockge
+          for _ in $(seq 60); do
+            case $(sudo podman exec circuit-dockge systemctl is-system-running 2>/dev/null) in running|degraded) break ;; esac
+            sleep 1
+          done
+          for _ in $(seq 120); do
+            sudo podman exec circuit-dockge podman exec dockge node -e 'fetch("http://127.0.0.1:5001").then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' 2>/dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Log in and find the stack running after the restart
+        working-directory: examples/local
+        run: *verify
+      - name: Plan again after the restart, with no changes
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      - name: Check only root can enter the data and stacks directories
+        run: |
+          [ "$(sudo podman exec circuit-dockge stat -c '%u %a' /var/lib/dockge)" = "0 700" ]
+          [ "$(sudo podman exec circuit-dockge stat -c '%u %a' /opt/stacks)" = "0 700" ]
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
