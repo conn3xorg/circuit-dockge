@@ -13,7 +13,7 @@ const what = process.argv[2];
 const RUNNING = 3;
 const compose = `services:
   web:
-    image: docker.io/library/nginx:1.29.3-alpine@sha256:b3c656d55d7ad751196f21b7fd2e8d4da9cb430e32f646adcf92441b72f82b14
+    image: docker.io/library/nginx:1.30.7-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
     ports:
       - 127.0.0.1:18080:80
     restart: unless-stopped
